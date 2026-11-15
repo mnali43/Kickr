@@ -418,7 +418,7 @@ dialog::backdrop { background: rgb(0 0 0 / .5); }
   const ZWIFT_COMPANY = 0x094a;
   const ZWIFT_SERVICES = [UUID.zwift, UUID.zwiftLegacy];
   const RIDE_ON = Uint8Array.of(0x52, 0x69, 0x64, 0x65, 0x4f, 0x6e); // "RideOn"
-  const APP_VERSION = '4 (15 Nov 2026)';
+  const APP_VERSION = '5 (15 Nov 2026)';
   const POWER_STEP = 5;
   const POWER_MIN = 50;
   const POWER_MAX = 600;
@@ -797,7 +797,7 @@ dialog::backdrop { background: rgb(0 0 0 / .5); }
   const control = { cp: null, state: 'none', reason: '', pending: false, busy: false, lastSent: null, waiting: null, chain: Promise.resolve() };
 
   function resetControl() {
-    Object.assign(control, { cp: null, state: 'none', reason: '', pending: false, lastSent: null, waiting: null, chain: Promise.resolve() });
+    Object.assign(control, { cp: null, wahoo: null, via: 'ftms', fails: 0, state: 'none', reason: '', pending: false, lastSent: null, waiting: null, chain: Promise.resolve() });
   }
   // One command at a time: write it, then wait for the trainer's 0x80 reply.
   function cpWrite(bytes, timeoutMs = 2000) {
@@ -847,8 +847,20 @@ dialog::backdrop { background: rgb(0 0 0 / .5); }
     control.reason = '';
     renderControl();
     let code;
-    try { code = await cpWrite(Uint8Array.of(0x00)); } catch (_) { code = -1; }
+    try { code = await cpWrite(Uint8Array.of(0x00)); } catch (err) { code = -1; log('Trainer', `request control failed: ${describeError(err)}`); }
     if (control.state !== 'starting') return;
+    if (code === -1 && control.wahoo) {
+      // The standard control link is refused; fall back to Wahoo's own control channel.
+      control.via = 'wahoo';
+      try { await control.wahoo.startNotifications(); } catch (err) { log('Trainer', `Wahoo replies off: ${describeError(err)}`); }
+      try { await writeBytes(control.wahoo, Uint8Array.of(0x20, 0xee, 0xfc)); log('Trainer', 'Wahoo control unlocked'); }
+      catch (err) { log('Trainer', `Wahoo unlock failed: ${describeError(err)}`); }
+      control.state = 'active';
+      control.lastSent = null;
+      renderControl();
+      queueSim();
+      return;
+    }
     if (code === -1) { control.state = 'lost'; control.reason = 'error'; renderControl(); return; }
     log('Trainer', `request control reply: ${code === null ? 'none' : code}`);
     if (code !== null && code !== 0x01) { control.state = 'refused'; control.reason = 'control'; renderControl(); return; }
@@ -869,10 +881,23 @@ dialog::backdrop { background: rgb(0 0 0 / .5); }
     try {
       while (control.pending && control.state === 'active' && control.cp) {
         control.pending = false;
-        const bytes = currentCommand();
+        let bytes = currentCommand();
+        if (control.via === 'wahoo') {
+          if (ride.mode !== 'power') { log('Trainer', 'gears need the standard control link; switch to power mode'); continue; }
+          bytes = Uint8Array.of(0x42, ride.watts & 0xff, ride.watts >> 8);
+        }
         if (control.lastSent && sameBytes(bytes, control.lastSent)) continue;
         let code;
-        try { code = await cpWrite(bytes, 1000); } catch (_) { code = -1; }
+        try {
+          if (control.via === 'wahoo') { await writeBytes(control.wahoo, bytes); code = 0x01; }
+          else code = await cpWrite(bytes, 1000);
+          control.fails = 0;
+        } catch (err) {
+          code = -1;
+          control.fails += 1;
+          log('Trainer', `command failed: ${describeError(err)}`);
+          if (control.fails >= 3) code = 0x04;
+        }
         log('Trainer', `sent ${Array.from(bytes).join(' ')}, reply ${code === null ? 'none' : code}`);
         if (code === 0x01 || code === null) {
           control.lastSent = bytes;
@@ -943,6 +968,10 @@ dialog::backdrop { background: rgb(0 0 0 / .5); }
     }
     try {
       const cps = await getService(server, UUID.power);
+      try {
+        control.wahoo = await cps.getCharacteristic('a026e005-0a7d-4ab3-97fa-f1500f9feb8b');
+        log('Trainer', 'Wahoo control channel found');
+      } catch (err) { log('Trainer', `no Wahoo control channel: ${describeError(err)}`); }
       try {
         await subscribe(await cps.getCharacteristic(UUID.powerMeasurement), onCyclingPower);
         streams += 1;
