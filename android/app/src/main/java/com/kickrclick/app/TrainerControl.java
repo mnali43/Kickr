@@ -1,12 +1,15 @@
 package com.kickrclick.app;
 
+import java.util.Arrays;
+
 /**
- * Takes control of the trainer and keeps its ERG target equal to the rider's target.
+ * Takes control of the trainer and keeps it doing what the rider chose: hold a power (ERG) or
+ * ride a simulated road in a virtual gear (free ride).
  *
- * <p>FTMS first: request control, start, then set target power, each step waiting for the
- * trainer's answer. If the trainer refuses FTMS, it switches to Wahoo's own channel. Only one
- * command is in flight at a time; when the rider presses quickly, the newest target is sent as
- * soon as the trainer answers the previous one. Plain Java so it can be tested off the phone.
+ * <p>FTMS first: request control, start, then send the command, each step waiting for the
+ * trainer's answer. If the trainer refuses FTMS, it switches to Wahoo's own channel (ERG only).
+ * Only one command is in flight at a time; when the rider presses quickly, the newest one is sent
+ * as soon as the trainer answers the previous one. Plain Java so it can be tested off the phone.
  */
 final class TrainerControl {
     interface Io extends Async.Timer {
@@ -21,6 +24,39 @@ final class TrainerControl {
 
         /** Something shown on screen changed. */
         void changed();
+    }
+
+    /** What the trainer should do. */
+    static final class Command {
+        final byte[] ftms;
+        final byte[] wahoo; // null when Wahoo's channel can't do it
+        final String label; // "150 W" or "gear 12"
+        final int watts; // the ERG target, or -1 for a simulated road
+
+        private Command(byte[] ftms, byte[] wahoo, String label, int watts) {
+            this.ftms = ftms;
+            this.wahoo = wahoo;
+            this.label = label;
+            this.watts = watts;
+        }
+
+        /** Hold this power. */
+        static Command erg(int watts) {
+            return new Command(Protocol.ftmsTargetPower(watts), Protocol.wahooErg(watts), watts + " W", watts);
+        }
+
+        /** Ride this simulated road ({@link Protocol#FTMS_SET_SIMULATION} bytes). */
+        static Command road(byte[] simulation, String label) {
+            return new Command(simulation, null, label, -1);
+        }
+
+        int op() {
+            return ftms[0] & 0xFF;
+        }
+
+        boolean sameAs(Command other) {
+            return other != null && Arrays.equals(ftms, other.ftms);
+        }
     }
 
     enum Phase { IDLE, REQUESTING, STARTING, READY, WAITING, FAILED }
@@ -40,9 +76,9 @@ final class TrainerControl {
     private boolean hasWahoo;
     private boolean ftmsReplies;
     private boolean triedWahoo;
-    private int target = -1; // what the rider wants
-    private int applied = -1; // what the trainer last accepted
-    private int sending = -1; // target in flight, -1 when none
+    private Command target; // what the rider wants
+    private Command applied; // what the trainer last accepted
+    private Command sending; // in flight, null when none
     private int awaitOp = -1; // FTMS command waiting for its answer
     private int token; // bumped whenever answers to older commands must be ignored
     private int requests;
@@ -70,8 +106,8 @@ final class TrainerControl {
         return via;
     }
 
-    /** The target the trainer has confirmed, or -1. */
-    int applied() {
+    /** The command the trainer has confirmed, or null. */
+    Command applied() {
         return applied;
     }
 
@@ -94,8 +130,8 @@ final class TrainerControl {
         }
     }
 
-    void setTarget(int watts) {
-        target = watts;
+    void setCommand(Command c) {
+        target = c;
         if (phase == Phase.READY) send(false);
     }
 
@@ -123,6 +159,10 @@ final class TrainerControl {
         starts++;
         changed();
         sendFtms(Protocol.FTMS_START, Protocol.ftmsStart(), false);
+    }
+
+    private static boolean isCommandOp(int op) {
+        return op == Protocol.FTMS_SET_TARGET_POWER || op == Protocol.FTMS_SET_SIMULATION;
     }
 
     private void sendFtms(final int op, byte[] data, boolean routine) {
@@ -171,6 +211,22 @@ final class TrainerControl {
 
     private void ftmsResult(int op, int result) {
         awaitOp = -1;
+        if (isCommandOp(op)) {
+            Command c = sending;
+            sending = null;
+            if (c == null) return;
+            if (result == Protocol.RESULT_SUCCESS) {
+                accepted(c);
+            } else if (result == Protocol.RESULT_NOT_PERMITTED) {
+                io.log("Trainer: control was lost, asking again");
+                requests = 0;
+                requestControl();
+            } else {
+                failures++;
+                setProblem("The trainer refused " + c.label + " (" + Protocol.ftmsResultName(result) + ").");
+            }
+            return;
+        }
         switch (op) {
             case Protocol.FTMS_REQUEST_CONTROL:
                 if (result == Protocol.RESULT_SUCCESS) {
@@ -202,21 +258,6 @@ final class TrainerControl {
                     }, 1000);
                 }
                 break;
-            case Protocol.FTMS_SET_TARGET_POWER: {
-                int w = sending;
-                sending = -1;
-                if (result == Protocol.RESULT_SUCCESS) {
-                    accepted(w);
-                } else if (result == Protocol.RESULT_NOT_PERMITTED) {
-                    io.log("Trainer: control was lost, asking again");
-                    requests = 0;
-                    requestControl();
-                } else {
-                    failures++;
-                    setProblem("The trainer refused " + w + " W (" + Protocol.ftmsResultName(result) + ").");
-                }
-                break;
-            }
             default:
                 break;
         }
@@ -226,13 +267,13 @@ final class TrainerControl {
         awaitOp = -1;
         String why = Protocol.opStatusName(status);
         io.log("Trainer: " + Protocol.ftmsOpName(op) + " could not be written: " + why);
-        if (op == Protocol.FTMS_SET_TARGET_POWER) {
-            sending = -1;
+        if (isCommandOp(op)) {
+            sending = null;
             failures++;
             if (failures >= 3 && hasWahoo && !triedWahoo) {
                 startWahoo("FTMS writes keep failing");
             } else {
-                setProblem("The trainer did not take the new target (" + why + ").");
+                setProblem("The trainer did not take the change (" + why + ").");
                 retrySend(2000);
             }
             return;
@@ -256,6 +297,13 @@ final class TrainerControl {
     private void ftmsTimeout(int op) {
         awaitOp = -1;
         io.log("Trainer: no answer to " + Protocol.ftmsOpName(op));
+        if (isCommandOp(op)) {
+            sending = null;
+            failures++;
+            if (failures >= 3 && hasWahoo && !triedWahoo) startWahoo("FTMS stopped answering");
+            else retrySend(1000);
+            return;
+        }
         switch (op) {
             case Protocol.FTMS_REQUEST_CONTROL:
                 if (requests < MAX_REQUESTS) {
@@ -270,12 +318,6 @@ final class TrainerControl {
                 break;
             case Protocol.FTMS_START:
                 becomeReady();
-                break;
-            case Protocol.FTMS_SET_TARGET_POWER:
-                sending = -1;
-                failures++;
-                if (failures >= 3 && hasWahoo && !triedWahoo) startWahoo("FTMS stopped answering");
-                else retrySend(1000);
                 break;
             default:
                 break;
@@ -299,6 +341,10 @@ final class TrainerControl {
         }, waits >= MAX_WAITS ? 10000 : WAIT_FOR_CONTROL_MS);
     }
 
+    private static int wattsOf(Command c) {
+        return c == null ? -1 : c.watts;
+    }
+
     /** A Machine Status notification. */
     void onMachineStatus(byte[] v) {
         if (stopped || v == null || v.length == 0) return;
@@ -306,9 +352,9 @@ final class TrainerControl {
         long now = io.now();
         switch (op) {
             case 0x08: {
-                if (v.length < 3) return;
+                if (v.length < 3 || target == null || target.watts < 0) return; // only matters in ERG
                 int w = Protocol.s16(v, 1);
-                if (w == applied || w == sending || w == target) return;
+                if (w == wattsOf(applied) || w == wattsOf(sending) || w == target.watts) return;
                 io.log("Trainer: target changed to " + w + " W by another app or device");
                 if (phase == Phase.READY && now - lastReassert > 5000) {
                     lastReassert = now;
@@ -392,61 +438,66 @@ final class TrainerControl {
         reset();
         phase = Phase.READY;
         problem = "";
-        io.log("Trainer: ERG is on (" + (via == Via.WAHOO ? "Wahoo channel" : "FTMS") + ")");
+        io.log("Trainer: under control (" + (via == Via.WAHOO ? "Wahoo channel" : "FTMS") + ")");
         changed();
         scheduleRefresh();
         send(false);
     }
 
-    /** Re-sends the target every so often, in case another app or the watch changed it. */
+    /** Re-sends the command every so often, in case another app or the watch changed it. */
     private void scheduleRefresh() {
         cancel(refreshTimer);
         refreshTimer = io.schedule(new Runnable() {
             @Override
             public void run() {
                 if (stopped) return;
-                if (phase == Phase.READY && sending < 0 && awaitOp < 0) send(true);
+                if (phase == Phase.READY && sending == null && awaitOp < 0) send(true);
                 scheduleRefresh();
             }
         }, REFRESH_MS);
     }
 
     private void send(boolean routine) {
-        if (stopped || phase != Phase.READY || target < 0) return;
-        if (sending >= 0 || awaitOp >= 0) return; // the answer to the one in flight sends the newest value
-        final int w = target;
-        sending = w;
+        if (stopped || phase != Phase.READY || target == null) return;
+        if (sending != null || awaitOp >= 0) return; // the answer to the one in flight sends the newest
+        final Command c = target;
         if (via == Via.FTMS) {
-            sendFtms(Protocol.FTMS_SET_TARGET_POWER, Protocol.ftmsTargetPower(w), routine);
+            sending = c;
+            sendFtms(c.op(), c.ftms, routine);
             return;
         }
+        if (c.wahoo == null) {
+            setProblem("Gears need the trainer's standard (FTMS) control, which it refused. ERG mode still works.");
+            return;
+        }
+        sending = c;
         final int t = ++token;
         quiet = routine;
-        if (!routine) io.log("Trainer: sent Wahoo ERG [" + Protocol.hex(Protocol.wahooErg(w)) + "]");
-        io.writeWahoo(Protocol.wahooErg(w), new Async.Done() {
+        if (!routine) io.log("Trainer: sent Wahoo ERG [" + Protocol.hex(c.wahoo) + "]");
+        io.writeWahoo(c.wahoo, new Async.Done() {
             @Override
             public void done(int status) {
                 if (stopped || t != token) return;
-                sending = -1;
+                sending = null;
                 if (status == Protocol.OK) {
-                    accepted(w);
+                    accepted(c);
                 } else {
                     failures++;
                     io.log("Trainer: Wahoo ERG could not be written: " + Protocol.opStatusName(status));
-                    setProblem("The trainer did not take the new target (" + Protocol.opStatusName(status) + ").");
+                    setProblem("The trainer did not take the change (" + Protocol.opStatusName(status) + ").");
                     retrySend(2000);
                 }
             }
         });
     }
 
-    private void accepted(int w) {
+    private void accepted(Command c) {
         failures = 0;
-        if (w != applied) io.log("Trainer: holding " + w + " W");
-        applied = w;
+        if (!c.sameAs(applied)) io.log("Trainer: set to " + c.label);
+        applied = c;
         problem = "";
         changed();
-        if (target >= 0 && target != applied) send(false);
+        if (target != null && !target.sameAs(applied)) send(false);
     }
 
     private void retrySend(long delayMs) {
@@ -472,7 +523,7 @@ final class TrainerControl {
     private void reset() {
         token++;
         awaitOp = -1;
-        sending = -1;
+        sending = null;
         cancel(replyTimer);
         cancel(retryTimer);
     }

@@ -71,10 +71,6 @@ final class ClickControl {
         return working;
     }
 
-    /** Every greeting was tried for a minute and no press arrived. */
-    boolean gaveUp() {
-        return gaveUp;
-    }
 
     void begin() {
         long now = io.now();
@@ -102,10 +98,9 @@ final class ClickControl {
         @Override
         public void run() {
             if (stopped || working) return;
-            if (io.now() - startedAt >= TRIAL_MS) {
-                gaveUp = true;
-                io.log("Click: no button presses arrived with any greeting");
-                return;
+            if (!gaveUp && io.now() - startedAt >= TRIAL_MS) {
+                gaveUp = true; // keep trying: the rider may simply not have pressed yet
+                io.log("Click: no button presses yet; still trying the greetings in turn");
             }
             greeting = (greeting + 1) % Protocol.CLICK_GREETINGS;
             greet();

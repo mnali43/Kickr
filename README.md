@@ -2,7 +2,10 @@
 
 ## KICKR Click (Android app)
 
-Zwift Click buttons set the KICKR's ERG power: **+** is harder, **B** is easier.
+Two modes, switched on the screen:
+
+- **ERG**: the KICKR holds a power. The Zwift Click's **+** and **B** buttons raise and lower it.
+- **Free ride**: ERG off. The KICKR rides a flat road and **+** and **B** change virtual gears (24, like Zwift's).
 
 Download: https://github.com/mnali43/Kickr/releases/download/app/KickrClick.apk
 

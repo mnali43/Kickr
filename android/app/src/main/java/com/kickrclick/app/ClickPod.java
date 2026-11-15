@@ -51,10 +51,6 @@ final class ClickPod implements BleLink.Listener {
         return control != null && control.pressesSeen();
     }
 
-    boolean gaveUp() {
-        return control != null && control.gaveUp();
-    }
-
     String address() {
         return link.address();
     }

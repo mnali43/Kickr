@@ -60,7 +60,11 @@ public final class MainActivity extends Activity implements Hub.View {
     private TextView trainerChip;
     private TextView clickChip;
     private TextView hint;
+    private TextView modeErg;
+    private TextView modeGears;
+    private TextView targetLabel;
     private TextView targetText;
+    private TextView unitText;
     private TextView confirmedText;
     private TextView stepText;
     private TextView powerText;
@@ -72,6 +76,7 @@ public final class MainActivity extends Activity implements Hub.View {
     private TextView logText;
     private boolean logOpen;
     private int shownLogVersion = -1;
+    private int shownMode = -1;
     private String blocker;
     private Runnable blockerAction;
     private boolean askedPermissions;
@@ -102,6 +107,7 @@ public final class MainActivity extends Activity implements Hub.View {
         super.onConfigurationChanged(config);
         setContentView(buildScreen()); // folded, unfolded or turned: lay out again for the new size
         shownLogVersion = -1;
+        shownMode = -1;
         render();
     }
 
@@ -283,23 +289,37 @@ public final class MainActivity extends Activity implements Hub.View {
         });
         col.addView(hint, matchWrap(12));
 
-        // Target
+        // ERG or free ride
+        LinearLayout modes = row();
+        modes.setPadding(dp(4), dp(4), dp(4), dp(4));
+        modes.setBackground(rounded(CARD, dp(16)));
+        modeErg = modeButton("ERG", Hub.MODE_ERG);
+        modeGears = modeButton("Free ride \u00b7 gears", Hub.MODE_GEARS);
+        LinearLayout.LayoutParams m1 = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1);
+        m1.rightMargin = dp(2);
+        LinearLayout.LayoutParams m2 = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1);
+        m2.leftMargin = dp(2);
+        modes.addView(modeErg, m1);
+        modes.addView(modeGears, m2);
+        col.addView(modes, matchWrap(12));
+
+        // Target power or gear
         LinearLayout card = new LinearLayout(this);
         card.setOrientation(LinearLayout.VERTICAL);
         card.setGravity(Gravity.CENTER_HORIZONTAL);
         card.setPadding(dp(16), dp(14), dp(16), dp(14));
         card.setBackground(rounded(CARD, dp(22)));
-        TextView label = text("ERG TARGET", 12, MUTED, true);
-        label.setLetterSpacing(0.12f);
-        card.addView(label);
+        targetLabel = text("ERG TARGET", 12, MUTED, true);
+        targetLabel.setLetterSpacing(0.12f);
+        card.addView(targetLabel);
         LinearLayout value = row();
         value.setGravity(Gravity.CENTER_HORIZONTAL);
         targetText = text("150", 104, ACCENT, true);
         digits(targetText);
         targetText.setIncludeFontPadding(false);
         value.addView(targetText);
-        TextView unit = text(" W", 30, MUTED, true);
-        value.addView(unit);
+        unitText = text(" W", 30, MUTED, true);
+        value.addView(unitText);
         card.addView(value);
         confirmedText = text("", 14, MUTED, false);
         confirmedText.setGravity(Gravity.CENTER);
@@ -424,13 +444,18 @@ public final class MainActivity extends Activity implements Hub.View {
         hint.setVisibility(advice == null ? View.GONE : View.VISIBLE);
         hint.setClickable(blocker != null && blockerAction != null);
 
-        targetText.setText(String.valueOf(hub.target()));
-        int confirmed = hub.confirmedTarget();
-        if (!hub.isRunning()) confirmedText.setText("");
-        else if (confirmed < 0) confirmedText.setText("Waiting for the trainer…");
-        else if (confirmed == hub.target()) confirmedText.setText("Trainer holding " + confirmed + " W ✓");
-        else confirmedText.setText("Trainer holding " + confirmed + " W, sending " + hub.target() + " W…");
-        stepText.setText("Step " + hub.step() + " W · tap to change");
+        boolean gears = hub.mode() == Hub.MODE_GEARS;
+        if (shownMode != hub.mode()) {
+            shownMode = hub.mode();
+            styleMode(modeErg, !gears);
+            styleMode(modeGears, gears);
+        }
+        targetLabel.setText(gears ? "GEAR \u00b7 ERG OFF" : "ERG TARGET");
+        targetText.setText(String.valueOf(gears ? hub.gear() : hub.target()));
+        unitText.setText(gears ? " / " + Gears.COUNT : " W");
+        confirmedText.setText(hub.confirmation());
+        stepText.setText("Step " + hub.step() + " W \u00b7 tap to change");
+        stepText.setVisibility(gears ? View.GONE : View.VISIBLE);
 
         int p = hub.power3s();
         powerText.setText(withUnit(p < 0 ? "–" : String.valueOf(p), "W"));
@@ -542,6 +567,26 @@ public final class MainActivity extends Activity implements Hub.View {
         b.setSpan(new RelativeSizeSpan(0.75f), start, b.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
         b.append('\n').append(status);
         chip.setText(b);
+    }
+
+    private TextView modeButton(String label, final int mode) {
+        TextView b = text(label, 15, MUTED, true);
+        b.setGravity(Gravity.CENTER);
+        b.setPadding(dp(8), dp(11), dp(8), dp(11));
+        b.setClickable(true);
+        b.setFocusable(true);
+        b.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                hub.setMode(mode);
+            }
+        });
+        return b;
+    }
+
+    private void styleMode(TextView b, boolean selected) {
+        b.setTextColor(selected ? BG : MUTED);
+        b.setBackground(selected ? rounded(ACCENT, dp(12)) : button(CARD, dp(12)));
     }
 
     private TextView bigButton(String label, String description, final int direction) {

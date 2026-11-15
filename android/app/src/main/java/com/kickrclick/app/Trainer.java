@@ -49,8 +49,8 @@ final class Trainer implements BleLink.Listener {
         return control;
     }
 
-    void setTarget(int watts) {
-        if (control != null) control.setTarget(watts);
+    void setCommand(TrainerControl.Command c) {
+        if (control != null) control.setCommand(c);
     }
 
     @Override
@@ -82,7 +82,7 @@ final class Trainer implements BleLink.Listener {
             @Override
             public void run() {
                 control = new TrainerControl(io);
-                control.setTarget(hub.target());
+                control.setCommand(hub.command());
                 control.begin(controlPoint != null, answersOn[0], wahoo != null);
                 hub.changed();
             }

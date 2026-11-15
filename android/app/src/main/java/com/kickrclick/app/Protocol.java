@@ -99,6 +99,7 @@ final class Protocol {
     static final int FTMS_RESET = 0x01;
     static final int FTMS_SET_TARGET_POWER = 0x05;
     static final int FTMS_START = 0x07;
+    static final int FTMS_SET_SIMULATION = 0x11;
     static final int FTMS_RESPONSE = 0x80;
 
     static final int RESULT_SUCCESS = 0x01;
@@ -133,7 +134,7 @@ final class Protocol {
             case FTMS_RESET: return "reset";
             case FTMS_SET_TARGET_POWER: return "set target power";
             case FTMS_START: return "start";
-            case 0x11: return "set simulation";
+            case FTMS_SET_SIMULATION: return "set simulation";
             default: return String.format(Locale.US, "op 0x%02x", op);
         }
     }

@@ -44,6 +44,11 @@ final class Hub {
     static final int START_W = 150;
     static final int[] STEPS = {5, 10, 25};
 
+    /** Hold a power. */
+    static final int MODE_ERG = 0;
+    /** Free ride: no ERG, the Click changes virtual gears. */
+    static final int MODE_GEARS = 1;
+
     private static Hub instance;
 
     static Hub get(Context context) {
@@ -60,6 +65,11 @@ final class Hub {
 
     private int target = START_W;
     private int step;
+    private int mode;
+    private int gear = Gears.START;
+    private int chainring;
+    private int chainCandidate = -1;
+    private int chainVotes;
 
     private Trainer trainer;
     private ClickPod click;
@@ -103,6 +113,9 @@ final class Hub {
         boolean known = false;
         for (int s : STEPS) known |= s == step;
         if (!known) step = 10;
+        mode = prefs.getInt("mode", MODE_ERG) == MODE_GEARS ? MODE_GEARS : MODE_ERG;
+        chainring = prefs.getInt("chainring", 50);
+        if (chainring < 28 || chainring > 56) chainring = 50;
         BluetoothManager manager = (BluetoothManager) app.getSystemService(Context.BLUETOOTH_SERVICE);
         adapter = manager == null ? null : manager.getAdapter();
         recordCrashes();
@@ -138,7 +151,8 @@ final class Hub {
         powerSum = 0;
         powerSeconds = 0;
         trainerMissingSince = SystemClock.elapsedRealtime();
-        log("Starting (target " + target + " W, step " + step + " W)");
+        log("Starting in " + (mode == MODE_GEARS ? "free ride, " + Gears.describe(gear) + ", chain on " + chainring + "T"
+                : "ERG, target " + target + " W, step " + step + " W"));
         main.removeCallbacks(everySecond);
         main.postDelayed(everySecond, 1000);
         updateScan();
@@ -182,12 +196,55 @@ final class Hub {
         return step;
     }
 
-    void stepTarget(int direction) {
-        int next = Math.max(MIN_W, Math.min(MAX_W, target + direction * step));
-        if (next == target) return;
-        target = next;
-        if (trainer != null) trainer.setTarget(target);
+    int mode() {
+        return mode;
+    }
+
+    int gear() {
+        return gear;
+    }
+
+    int chainring() {
+        return chainring;
+    }
+
+    /** What the trainer should be doing right now. */
+    TrainerControl.Command command() {
+        if (mode == MODE_GEARS) return TrainerControl.Command.road(Gears.simulation(gear, 0, chainring), Gears.describe(gear));
+        return TrainerControl.Command.erg(target);
+    }
+
+    private void sendCommand() {
+        if (trainer != null) trainer.setCommand(command());
         changed();
+    }
+
+    /** + (harder) or − (easier): a power step in ERG, a gear in free ride. */
+    void stepTarget(int direction) {
+        if (mode == MODE_GEARS) {
+            int next = Math.max(1, Math.min(Gears.COUNT, gear + direction));
+            if (next == gear) return;
+            gear = next;
+        } else {
+            int next = Math.max(MIN_W, Math.min(MAX_W, target + direction * step));
+            if (next == target) return;
+            target = next;
+        }
+        sendCommand();
+    }
+
+    void setMode(int m) {
+        if (m == mode) return;
+        mode = m;
+        prefs.edit().putInt("mode", mode).apply();
+        log(mode == MODE_GEARS ? "Free ride: ERG off, the Click changes gears (" + Gears.describe(gear) + ")"
+                : "ERG: holding " + target + " W, the Click changes the power");
+        sendCommand();
+    }
+
+    /** What + and B did, for the log. */
+    private String targetText() {
+        return mode == MODE_GEARS ? Gears.describe(gear) : target + " W";
     }
 
     void cycleStep() {
@@ -203,10 +260,10 @@ final class Hub {
         String name = Protocol.buttonName(bit);
         if (bit == Protocol.BTN_PLUS) {
             stepTarget(+1);
-            log("Click " + name + " → " + target + " W");
+            log("Click " + name + " → " + targetText());
         } else if (bit == Protocol.BTN_B || bit == Protocol.BTN_MINUS) {
             stepTarget(-1);
-            log("Click " + name + " → " + target + " W");
+            log("Click " + name + " → " + targetText());
         } else {
             log("Click " + name + " (not used)");
         }
@@ -486,6 +543,23 @@ final class Hub {
             speed = d.speedKmh;
             speedAt = now;
         }
+        noticeChainring(d.speedKmh, d.cadenceRpm);
+    }
+
+    /** Works out which chainring the chain is on; it takes 10 matching readings in a row to change. */
+    private void noticeChainring(double speedKmh, double cadenceRpm) {
+        int ring = Gears.chainringFrom(speedKmh, cadenceRpm);
+        if (ring < 0) return;
+        if (ring != chainCandidate) {
+            chainCandidate = ring;
+            chainVotes = 0;
+        }
+        if (++chainVotes < 10 || ring == chainring) return;
+        chainring = ring;
+        prefs.edit().putInt("chainring", chainring).apply();
+        log(String.format(Locale.US, "The chain is on the %dT chainring (%.1f km/h at %.0f rpm)", ring, speedKmh, cadenceRpm));
+        if (mode == MODE_GEARS) sendCommand();
+        else changed();
     }
 
     void onPowerData(Protocol.PowerData p) {
@@ -531,8 +605,12 @@ final class Hub {
         return SystemClock.elapsedRealtime() - cadenceAt > 4000 ? -1 : (int) Math.round(cadence);
     }
 
-    /** Speed in km/h, or NaN. */
+    /** Speed in km/h, or NaN. In free ride it's the road speed of the virtual gear. */
     double speed() {
+        if (mode == MODE_GEARS) {
+            int c = cadence();
+            return c < 0 ? Double.NaN : Gears.speedKmh(gear, c);
+        }
         return SystemClock.elapsedRealtime() - speedAt > 4000 ? Double.NaN : speed;
     }
 
@@ -569,7 +647,8 @@ final class Hub {
         TrainerControl c = trainer.control();
         if (c == null) return "Setting up…";
         switch (c.phase()) {
-            case READY: return c.via() == TrainerControl.Via.WAHOO ? "ERG on · Wahoo" : "ERG on";
+            case READY:
+                return (mode == MODE_GEARS ? "Free ride" : "ERG on") + (c.via() == TrainerControl.Via.WAHOO ? " · Wahoo" : "");
             case WAITING: return "Waiting for control";
             case FAILED: return "No control";
             default: return "Taking control…";
@@ -609,10 +688,17 @@ final class Hub {
         return click.isConnected() ? 2 : 1;
     }
 
-    /** The target the trainer has confirmed, or -1. */
-    int confirmedTarget() {
+    /** The line under the big number: whether the trainer has taken the latest change. */
+    String confirmation() {
+        if (!running) return "";
         TrainerControl c = trainer == null ? null : trainer.control();
-        return c == null || c.phase() != TrainerControl.Phase.READY ? -1 : c.applied();
+        TrainerControl.Command applied = c == null || c.phase() != TrainerControl.Phase.READY ? null : c.applied();
+        String chain = mode == MODE_GEARS ? "like " + Gears.likeGear(gear) + " · flat road · chain on " + chainring + "T" : null;
+        if (applied == null) return chain != null ? chain : "Waiting for the trainer…";
+        boolean done = applied.sameAs(command());
+        if (mode == MODE_GEARS) return chain + (done ? " ✓" : " · sending…");
+        return done ? "Trainer holding " + target + " W ✓"
+                : (applied.watts >= 0 ? "Trainer holding " + applied.watts + " W, sending " + target + " W…" : "Sending " + target + " W…");
     }
 
     /** One line of advice, or null. */
@@ -630,10 +716,7 @@ final class Hub {
                     : "Press a button on the right Click pod to wake it up.";
         }
         if (click.isConnected() && clickGreeting() < 0 && !click.pressesSeen()) {
-            if (click.gaveUp()) {
-                return "No button presses came from the Click. Close Zwift on the iPad completely, then tap Copy log and send the log to Claude.";
-            }
-            return "Press + on the right Click pod once every second or two until the target number changes (it can take up to a minute the first time).";
+            return "First time only: press + on the right Click pod once every second or two until the number changes (up to a minute).";
         }
         return null;
     }
