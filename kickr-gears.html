@@ -122,6 +122,7 @@ button { cursor: pointer; -webkit-tap-highlight-color: transparent; touch-action
   grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 .f-gear, .f-road { grid-column: 1 / -1; }
+.board.power .f-gear { grid-column: 1 / -1; }
 @media (min-width: 720px) {
   .board { grid-template-columns: repeat(6, minmax(0, 1fr)); }
   .f-gear { grid-column: span 4; }
@@ -207,6 +208,13 @@ dialog::backdrop { background: rgb(0 0 0 / .5); }
 .hint { margin: 8px 0 0; font-size: 13px; color: var(--muted); }
 .steps { margin: 6px 0 0; padding-left: 20px; display: grid; gap: 8px; font-size: 14px; }
 
+.log {
+  margin: 6px 0 0; max-height: 240px; overflow: auto; padding: 10px 12px;
+  border: 1px solid var(--rule); border-radius: 10px; background: var(--bg); color: var(--ink);
+  font: 500 12px/1.5 ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere;
+}
+.log-actions { display: flex; align-items: center; gap: 10px; margin-top: 8px; }
+
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; }
 }
@@ -246,21 +254,21 @@ dialog::backdrop { background: rgb(0 0 0 / .5); }
     <button type="button" class="link" id="notice-action" hidden>Open settings</button>
   </div>
 
-  <main class="board">
+  <main class="board" id="board">
     <section class="field f-gear" aria-label="Gear">
-      <div class="f-head"><span class="f-label">Gear</span><span class="f-note" id="g-like">like 50×18</span></div>
+      <div class="f-head"><span class="f-label" id="g-label">Gear</span><span class="f-note" id="g-like">like 50×18</span></div>
       <div class="gear-top">
-        <div class="gear-big" id="g-big"><span class="num" id="g-val" aria-live="polite">12</span><span class="gear-of">/24</span></div>
+        <div class="gear-big" id="g-big"><span class="num" id="g-val" aria-live="polite">12</span><span class="gear-of" id="g-of">/24</span></div>
         <div class="ladder" id="ladder" aria-hidden="true"></div>
       </div>
-      <div class="gear-meta"><span>Ratio <b id="g-ratio">1.95</b></span><span id="g-map">+ harder · − or B easier</span></div>
+      <div class="gear-meta"><span id="g-sub">Ratio <b id="g-ratio">1.95</b></span><span id="g-map">+ harder · − or B easier</span><button type="button" class="link" id="mode-btn">Switch to power</button></div>
       <div class="shift">
-        <button type="button" class="shift-btn" id="shift-down"><span class="sym" aria-hidden="true">−</span>Easier</button>
-        <button type="button" class="shift-btn" id="shift-up"><span class="sym" aria-hidden="true">+</span>Harder</button>
+        <button type="button" class="shift-btn" id="shift-down"><span class="sym" aria-hidden="true">−</span><span id="down-text">Easier</span></button>
+        <button type="button" class="shift-btn" id="shift-up"><span class="sym" aria-hidden="true">+</span><span id="up-text">Harder</span></button>
       </div>
     </section>
 
-    <section class="field f-road" aria-label="Road grade">
+    <section class="field f-road" id="f-road" aria-label="Road grade">
       <div class="f-head"><span class="f-label">Road</span><span class="f-unit">%</span></div>
       <div class="road-row">
         <button type="button" class="step-btn" id="grade-down" aria-label="Flatter"><span class="sym" aria-hidden="true">−</span></button>
@@ -356,6 +364,16 @@ dialog::backdrop { background: rgb(0 0 0 / .5); }
       </ol>
       <p class="hint">For Garmin Coach workouts, leave the trainer disconnected here and let the Fenix control it. Outside Zwift, the left Click (−) only works for about a day after the Zwift app last unlocked it. The right Click works on its own.</p>
     </section>
+
+    <section id="log" aria-labelledby="h-log">
+      <h3 id="h-log">Connection log</h3>
+      <pre class="log" id="log-text">Nothing yet.</pre>
+      <div class="log-actions">
+        <button type="button" class="btn" id="log-copy">Copy log</button>
+        <span class="row-sub" id="log-copied" aria-live="polite"></span>
+      </div>
+      <p class="hint">If a sensor won't connect, copy this log and share it with whoever is helping you.</p>
+    </section>
   </div>
 </dialog>
 
@@ -400,6 +418,29 @@ dialog::backdrop { background: rgb(0 0 0 / .5); }
   const ZWIFT_COMPANY = 0x094a;
   const ZWIFT_SERVICES = [UUID.zwift, UUID.zwiftLegacy];
   const RIDE_ON = Uint8Array.of(0x52, 0x69, 0x64, 0x65, 0x4f, 0x6e); // "RideOn"
+  const APP_VERSION = '3 (15 Nov 2026)';
+  const POWER_STEP = 5;
+  const POWER_MIN = 50;
+  const POWER_MAX = 600;
+  const sleep = (ms) => new Promise((resolve) => { setTimeout(resolve, ms); });
+  const shortUuid = (u) => (/^0000([0-9a-f]{4})-0000-1000-8000-00805f9b34fb$/i.exec(String(u)) || [null, String(u)])[1];
+  const connecting = new Set(); // sensors in the middle of a connection attempt
+
+  /* ---------- connection log (Settings › Connection log) ---------- */
+  const logLines = [];
+  function log(source, message) {
+    const t = new Date();
+    const stamp = [t.getHours(), t.getMinutes(), t.getSeconds()].map((n) => String(n).padStart(2, '0')).join(':');
+    logLines.push(`${stamp}  ${source}: ${message}`);
+    if (logLines.length > 80) logLines.shift();
+    const pre = document.getElementById('log-text');
+    if (pre) pre.textContent = logLines.join('\n');
+  }
+  function describeError(err) {
+    if (!err) return 'unknown error';
+    const name = err.name && err.name !== 'Error' ? `${err.name}: ` : '';
+    return `${name}${err.message || String(err)}`;
+  }
 
   /* ---------- stored settings ---------- */
   const store = {
@@ -432,7 +473,12 @@ dialog::backdrop { background: rgb(0 0 0 / .5); }
     cog: clampInt(store.get('cog', 14), 10, 40, 14),
     map: loadMap(),
   };
-  const ride = { gear: START_GEAR, grade: 0 };
+  const ride = {
+    gear: START_GEAR,
+    grade: 0,
+    mode: store.get('mode', 'gears') === 'power' ? 'power' : 'gears',
+    watts: clampInt(store.get('watts', 150), POWER_MIN, POWER_MAX, 150),
+  };
 
   /* ---------- gears ---------- */
   const ratioOf = (gear) => GEARS[gear - 1];
@@ -466,6 +512,11 @@ dialog::backdrop { background: rgb(0 0 0 / .5); }
     dv.setUint8(5, p.crr);
     dv.setUint8(6, p.cw);
     return new Uint8Array(dv.buffer);
+  }
+  // Power mode holds a target (FTMS Set Target Power); gears mode shapes the road.
+  function currentCommand() {
+    if (ride.mode === 'power') return Uint8Array.of(0x05, ride.watts & 0xff, ride.watts >> 8);
+    return encodeSim(simParams());
   }
   const sameBytes = (a, b) => a.length === b.length && a.every((x, i) => x === b[i]);
 
@@ -683,6 +734,15 @@ dialog::backdrop { background: rgb(0 0 0 / .5); }
     // The sample rider aims for steady watts and lets cadence follow the gear.
     feed(now, dt) {
       this.sec += dt;
+      if (ride.mode === 'power') {
+        pushPower(now, ride.watts + 6 * this.noise());
+        live.cad = 88 + 2 * this.noise();
+        live.cadAt = now;
+        this.hr += (100 + 0.27 * ride.watts - this.hr) * (1 - Math.exp(-dt / 25));
+        live.hr = Math.round(this.hr);
+        live.hrAt = now;
+        return;
+      }
       const effort = 185 + 15 * Math.sin(this.sec / 47) + 8 * this.noise();
       const ratio = ratioOf(ride.gear);
       const v = speedForPower(effort, ride.grade);
@@ -773,7 +833,7 @@ dialog::backdrop { background: rgb(0 0 0 / .5); }
     if (!dv.byteLength) return;
     const op = dv.getUint8(0);
     if (op === 0xff) loseControl('lost');        // control permission lost
-    else if (op === 0x08) loseControl('erg');    // a power target was set; this page never sets one
+    else if (op === 0x08 && ride.mode !== 'power') loseControl('erg');    // a power target was set; this page never sets one
   }
   function loseControl(reason) {
     if (control.state !== 'active' && control.state !== 'starting') return;
@@ -808,7 +868,7 @@ dialog::backdrop { background: rgb(0 0 0 / .5); }
     try {
       while (control.pending && control.state === 'active' && control.cp) {
         control.pending = false;
-        const bytes = encodeSim(simParams());
+        const bytes = currentCommand();
         if (control.lastSent && sameBytes(bytes, control.lastSent)) continue;
         let code;
         try { code = await cpWrite(bytes, 1000); } catch (_) { code = -1; }
@@ -837,26 +897,55 @@ dialog::backdrop { background: rgb(0 0 0 / .5); }
     try { await cpWrite(encodeSim({ wind: 0, grade: 0, crr: 40, cw: 51 }), 800); } catch (_) { /* already gone */ }
   }
 
+  // Android sometimes fails the first read of a service; one more try usually works.
+  async function getService(server, uuid) {
+    try {
+      return await server.getPrimaryService(uuid);
+    } catch (err) {
+      if (err && err.name === 'NotFoundError') throw err; // genuinely not offered
+      await sleep(700);
+      return server.getPrimaryService(uuid);
+    }
+  }
   async function setupTrainer(server) {
     resetControl();
     let streams = 0;
+    try {
+      const all = await server.getPrimaryServices();
+      log('Trainer', `services: ${all.map((s) => shortUuid(s.uuid)).join(', ') || 'none'}`);
+    } catch (err) {
+      log('Trainer', `could not list services: ${describeError(err)}`);
+    }
     let ftms = null;
-    try { ftms = await server.getPrimaryService(UUID.ftms); } catch (_) { ftms = null; }
+    try { ftms = await getService(server, UUID.ftms); } catch (err) { log('Trainer', `no FTMS service: ${describeError(err)}`); }
     if (ftms) {
-      try { await subscribe(await ftms.getCharacteristic(UUID.bikeData), onIndoorBikeData); streams += 1; } catch (_) { /* not offered */ }
-      try { await subscribe(await ftms.getCharacteristic(UUID.machineStatus), onMachineStatus); } catch (_) { /* not offered */ }
-      try { control.cp = await subscribe(await ftms.getCharacteristic(UUID.controlPoint), onControlPoint); } catch (_) { control.cp = null; }
+      try {
+        await subscribe(await ftms.getCharacteristic(UUID.bikeData), onIndoorBikeData);
+        streams += 1;
+        log('Trainer', 'bike data on');
+      } catch (err) { log('Trainer', `bike data failed: ${describeError(err)}`); }
+      try {
+        await subscribe(await ftms.getCharacteristic(UUID.machineStatus), onMachineStatus);
+      } catch (err) { log('Trainer', `status failed: ${describeError(err)}`); }
+      try {
+        control.cp = await subscribe(await ftms.getCharacteristic(UUID.controlPoint), onControlPoint);
+        log('Trainer', 'control point on');
+      } catch (err) {
+        control.cp = null;
+        log('Trainer', `control point failed: ${describeError(err)}`);
+      }
     }
     try {
-      const cps = await server.getPrimaryService(UUID.power);
+      const cps = await getService(server, UUID.power);
       await subscribe(await cps.getCharacteristic(UUID.powerMeasurement), onCyclingPower);
       streams += 1;
-    } catch (_) { /* no cycling power service */ }
+      log('Trainer', 'power service on');
+    } catch (err) { log('Trainer', `power service failed: ${describeError(err)}`); }
     try {
       const hrs = await server.getPrimaryService(UUID.heartRate);
       await subscribe(await hrs.getCharacteristic(UUID.hrMeasurement), onTrainerHr);
     } catch (_) { /* trainer is not relaying heart rate */ }
-    if (!streams) throw new Error('No power data on this device');
+    if (!streams) throw new Error('Connected, but the trainer sent no power data');
     control.state = control.cp ? 'idle' : 'unsupported';
   }
   function onTrainerUp() {
@@ -884,7 +973,11 @@ dialog::backdrop { background: rgb(0 0 0 / .5); }
     stopKeepAlive();
     let service = null;
     for (const uuid of ZWIFT_SERVICES) {
-      try { service = await server.getPrimaryService(uuid); break; } catch (_) { /* try the next one */ }
+      try {
+        service = await getService(server, uuid);
+        log('Click', `controller service ${shortUuid(uuid)}`);
+        break;
+      } catch (_) { /* try the next one */ }
     }
     if (!service) throw new Error('This is not a Zwift controller');
     const notify = await service.getCharacteristic(UUID.zwiftNotify);
@@ -919,7 +1012,7 @@ dialog::backdrop { background: rgb(0 0 0 / .5); }
   function startKeepAlive() {
     stopKeepAlive();
     pad.timer = setInterval(() => {
-      if (shifter.state === 'live') padWrite(RIDE_ON).catch(() => {});
+      if (shifter.state === 'live' && !connecting.size) padWrite(RIDE_ON).catch(() => {});
     }, 3000);
   }
   function stopKeepAlive() {
@@ -989,7 +1082,32 @@ dialog::backdrop { background: rgb(0 0 0 / .5); }
   }
 
   /* ---------- shifting and road ---------- */
+  function changeWatts(delta) {
+    const next = clamp(ride.watts + delta, POWER_MIN, POWER_MAX);
+    if (next !== ride.watts) {
+      ride.watts = next;
+      store.set('watts', next);
+      queueSim();
+      bump();
+    }
+    renderGear();
+    if (demo.on) tick();
+  }
+  function setMode(mode) {
+    ride.mode = mode;
+    store.set('mode', mode);
+    control.lastSent = null;
+    queueSim();
+    renderGear();
+    renderRoad();
+    renderControl();
+    if (demo.on) tick();
+  }
   function shift(delta) {
+    if (ride.mode === 'power') {
+      changeWatts(delta * POWER_STEP);
+      return;
+    }
     const next = clamp(ride.gear + delta, 1, GEAR_COUNT);
     if (next !== ride.gear) {
       ride.gear = next;
@@ -1023,6 +1141,7 @@ dialog::backdrop { background: rgb(0 0 0 / .5); }
       this.armed = false;
       this.armTimer = 0;
       this.battery = null;
+      this.lastError = '';
       this.watchAbort = null;
       this.onGattDisconnected = () => this.handleDisconnect();
     }
@@ -1035,6 +1154,7 @@ dialog::backdrop { background: rgb(0 0 0 / .5); }
     }
     async choose(broad) {
       const device = await navigator.bluetooth.requestDevice(this.request(broad));
+      log(this.title, `picked ${device.name || 'a device without a name'}`);
       this.adopt(device);
       await this.connect();
     }
@@ -1056,9 +1176,15 @@ dialog::backdrop { background: rgb(0 0 0 / .5); }
       clearTimeout(this.timer);
       this.timer = 0;
       this.busy = true;
+      connecting.add(this);
+      pauseWatchers(); // Android connects more reliably when nothing is scanning
       this.setState(this.attempt ? 'reconnecting' : 'connecting');
       try {
+        log(this.title, `connecting to ${this.device.name || 'device'} (attempt ${this.attempt + 1})`);
         const server = await this.device.gatt.connect();
+        log(this.title, 'link open');
+        await sleep(600); // Android needs a moment before it can read services
+        if (!this.device.gatt.connected) throw new DOMException('The device dropped the link right after connecting.', 'NetworkError');
         await this.setup(server, this);
         if (!this.wanted) {
           this.device.gatt.disconnect();
@@ -1066,19 +1192,29 @@ dialog::backdrop { background: rgb(0 0 0 / .5); }
         }
         this.attempt = 0;
         this.everLive = true;
+        this.lastError = '';
+        log(this.title, 'ready');
         this.setState('live');
         sensorLive(this);
-      } catch (_) {
+      } catch (err) {
+        this.lastError = describeError(err);
+        log(this.title, `failed: ${this.lastError}`);
         if (this.onDown) this.onDown();
+        // Close a half-open link so the next attempt starts clean.
+        try { if (this.device.gatt.connected) this.device.gatt.disconnect(); } catch (_) { /* already gone */ }
         if (this.wanted) this.retryLater();
         else this.setState('off');
       } finally {
         this.busy = false;
+        connecting.delete(this);
+        if (!connecting.size) resumeWatchers();
+        renderNotice();
       }
     }
     retryLater() {
       this.attempt += 1;
       const delay = Math.min(this.maxDelay, 1000 * 2 ** Math.min(this.attempt - 1, 5));
+      log(this.title, `trying again in ${Math.round(delay / 1000)} s`);
       this.setState('reconnecting');
       clearTimeout(this.timer);
       this.timer = setTimeout(() => { this.timer = 0; this.connect(); }, delay);
@@ -1086,6 +1222,7 @@ dialog::backdrop { background: rgb(0 0 0 / .5); }
     handleDisconnect() {
       if (this.onDown) this.onDown();
       if (this.busy || this.timer) return;
+      log(this.title, 'link lost');
       if (this.wanted) this.retryLater();
       else this.setState('off');
     }
@@ -1176,20 +1313,37 @@ dialog::backdrop { background: rgb(0 0 0 / .5); }
       if (!device || sensor.device) continue;
       sensor.adopt(device);
       sensor.setState('waiting');
-      if (typeof device.watchAdvertisements !== 'function') { sensor.connect(); continue; }
-      const ac = new AbortController();
-      sensor.watchAbort = ac;
-      device.addEventListener('advertisementreceived', () => {
-        if (ac.signal.aborted) return;
+      log(sensor.title, `waiting for ${device.name || 'the saved device'} to wake`);
+      if (!connecting.size) watchFor(sensor);
+    }
+  }
+  async function watchFor(sensor) {
+    const device = sensor.device;
+    if (!device) return;
+    if (typeof device.watchAdvertisements !== 'function') { sensor.connect(); return; }
+    const ac = new AbortController();
+    sensor.watchAbort = ac;
+    device.addEventListener('advertisementreceived', () => {
+      if (ac.signal.aborted) return;
+      ac.abort();
+      sensor.watchAbort = null;
+      if (sensor.device === device && sensor.state === 'waiting') sensor.connect();
+    }, { signal: ac.signal });
+    try {
+      await device.watchAdvertisements({ signal: ac.signal });
+    } catch (_) {
+      if (!ac.signal.aborted) {
         ac.abort();
-        if (sensor.device === device && sensor.state === 'waiting') sensor.connect();
-      }, { signal: ac.signal });
-      try {
-        await device.watchAdvertisements({ signal: ac.signal });
-      } catch (_) {
-        if (!ac.signal.aborted) { ac.abort(); sensor.connect(); }
+        sensor.watchAbort = null;
+        sensor.connect();
       }
     }
+  }
+  function pauseWatchers() {
+    for (const s of sensors) if (s.watchAbort) s.stopWatching();
+  }
+  function resumeWatchers() {
+    for (const s of sensors) if (s.state === 'waiting' && !s.watchAbort) watchFor(s);
   }
 
   const PROBLEMS = {
@@ -1215,6 +1369,7 @@ dialog::backdrop { background: rgb(0 0 0 / .5); }
     sensor.choose(useBroad).catch((err) => {
       const name = err && err.name;
       const message = (err && err.message) || '';
+      log(sensor.title, `picker: ${describeError(err)}`);
       if (name === 'TypeError' && !useBroad && sensor === shifter) {
         preciseFilters = false; // this browser can't filter by maker data
         connectSensor(sensor, true);
@@ -1313,6 +1468,23 @@ dialog::backdrop { background: rgb(0 0 0 / .5); }
     big.classList.add('bump');
   }
   function renderGear() {
+    const power = ride.mode === 'power';
+    $('board').classList.toggle('power', power);
+    $('f-road').hidden = power;
+    $('g-of').hidden = power;
+    $('ladder').hidden = power;
+    $('g-sub').hidden = power;
+    $('g-label').textContent = power ? 'Target power' : 'Gear';
+    $('down-text').textContent = power ? `${POWER_STEP} W less` : 'Easier';
+    $('up-text').textContent = power ? `${POWER_STEP} W more` : 'Harder';
+    $('mode-btn').textContent = power ? 'Switch to gears' : 'Switch to power';
+    if (power) {
+      $('g-val').textContent = String(ride.watts);
+      $('g-like').textContent = 'W';
+      $('shift-down').disabled = ride.watts <= POWER_MIN;
+      $('shift-up').disabled = ride.watts >= POWER_MAX;
+      return;
+    }
     const r = ratioOf(ride.gear);
     $('g-val').textContent = String(ride.gear);
     $('g-ratio').textContent = r.toFixed(2);
@@ -1385,7 +1557,7 @@ dialog::backdrop { background: rgb(0 0 0 / .5); }
   function renderControl() {
     let text = 'Connect the trainer to use the gears.';
     if (trainer.state === 'live') {
-      if (control.state === 'active') text = `Gears on. The page sets the trainer's resistance for a chain on ${settings.chainring}×${settings.cog}.`;
+      if (control.state === 'active') text = ride.mode === 'power' ? 'Power mode on. The trainer holds your target watts.' : `Gears on. The page sets the trainer's resistance for a chain on ${settings.chainring}×${settings.cog}.`;
       else if (control.state === 'idle' || control.state === 'starting') text = 'Taking control of the trainer…';
       else if (control.state === 'lost') text = 'Gears paused. Something else is controlling the trainer.';
       else if (control.state === 'refused') text = 'Gears off. The trainer refused the gear command.';
@@ -1407,11 +1579,12 @@ dialog::backdrop { background: rgb(0 0 0 / .5); }
     };
     renderNotice();
   }
-  const ACTIONS = { setup: 'How to set it up', settings: 'Open settings', take: 'Take control', 'click-all': 'Show all Zwift devices' };
+  const ACTIONS = { setup: 'How to set it up', settings: 'Open settings', take: 'Take control', 'click-all': 'Show all Zwift devices', log: 'Show details' };
   function renderNotice() {
     const now = performance.now();
     if (override && now > override.until) override = null;
     const problem = bluetoothProblem();
+    const failing = sensors.find((s) => s.state === 'reconnecting' && !s.everLive && s.lastError);
     let tone = 'info';
     let pill = '';
     let text = '';
@@ -1422,6 +1595,11 @@ dialog::backdrop { background: rgb(0 0 0 / .5); }
       tone = 'alert'; pill = 'Bluetooth'; text = PROBLEMS[problem];
       if (problem !== 'unsupported') action = 'setup';
       if (demo.on) text += ' Until then, the numbers below are a sample ride.';
+    } else if (failing) {
+      tone = 'alert'; pill = failing.title; action = 'log';
+      const noun = { trainer: 'trainer', click: 'Click', hr: 'heart-rate strap' }[failing.kind];
+      text = `The ${noun} won't connect yet (${failing.lastError}). The app keeps trying.`;
+      if (failing === trainer) text += " If it doesn't connect within a minute, unplug the KICKR for 10 seconds and turn the phone's Bluetooth off and on.";
     } else if (trainer.state === 'live' && control.state === 'lost') {
       tone = 'alert'; pill = 'Gears'; action = 'take';
       text = control.reason === 'erg'
@@ -1503,7 +1681,7 @@ dialog::backdrop { background: rgb(0 0 0 / .5); }
       if (typeof dialog.showModal === 'function') dialog.showModal();
       else dialog.setAttribute('open', '');
     }
-    if (section === 'setup') $('setup').scrollIntoView({ block: 'start' });
+    if (section && $(section)) $(section).scrollIntoView({ block: 'start' });
   }
   function closeSettings() {
     if (typeof dialog.close === 'function') dialog.close();
@@ -1528,6 +1706,7 @@ dialog::backdrop { background: rgb(0 0 0 / .5); }
 
   /* ---------- wiring ---------- */
   for (const s of sensors) s.button.addEventListener('click', () => tapSensor(s));
+  $('mode-btn').addEventListener('click', () => setMode(ride.mode === 'power' ? 'gears' : 'power'));
   $('shift-up').addEventListener('click', () => shift(1));
   $('shift-down').addEventListener('click', () => shift(-1));
   $('grade-up').addEventListener('click', () => changeGrade(GRADE_STEP));
@@ -1544,7 +1723,7 @@ dialog::backdrop { background: rgb(0 0 0 / .5); }
     override = null;
     if (action === 'take') takeControl();
     else if (action === 'click-all') connectSensor(shifter, true);
-    else openSettings(action === 'setup' ? 'setup' : '');
+    else openSettings(action === 'setup' || action === 'log' ? action : '');
     renderNotice();
   });
   $('set-ring').addEventListener('change', (e) => onChainChange(e.target, 'chainring', 20, 60));
@@ -1557,6 +1736,20 @@ dialog::backdrop { background: rgb(0 0 0 / .5); }
     settings.map = { harder: DEFAULT_MAP.harder.slice(), easier: DEFAULT_MAP.easier.slice() };
     store.set('buttons', settings.map);
     endLearn('Default buttons restored.');
+  });
+  $('log-copy').addEventListener('click', async () => {
+    const text = logLines.join('\n') || 'Nothing yet.';
+    try {
+      await navigator.clipboard.writeText(text);
+      $('log-copied').textContent = 'Copied.';
+    } catch (_) {
+      const range = document.createRange();
+      range.selectNodeContents($('log-text'));
+      const selection = window.getSelection();
+      selection.removeAllRanges();
+      selection.addRange(range);
+      $('log-copied').textContent = 'Selected. Use Copy from the menu.';
+    }
   });
   resetButton.addEventListener('click', () => {
     if (resetButton.dataset.armed !== 'true') {
@@ -1595,6 +1788,8 @@ dialog::backdrop { background: rgb(0 0 0 / .5); }
   });
 
   /* ---------- start ---------- */
+  log('App', `KICKR Gears version ${APP_VERSION}`);
+  log('App', navigator.userAgent);
   buildLadder();
   renderMapping();
   renderDevices();
@@ -1612,7 +1807,7 @@ dialog::backdrop { background: rgb(0 0 0 / .5); }
     simParams,
     encodeSim,
     frame(bytes) { handlePadFrame(new DataView(Uint8Array.from(bytes).buffer)); },
-    state: () => ({ gear: ride.gear, grade: ride.grade, control: control.state, reason: control.reason, map: settings.map, demo: demo.on }),
+    state: () => ({ mode: ride.mode, watts: ride.watts, gear: ride.gear, grade: ride.grade, control: control.state, reason: control.reason, map: settings.map, demo: demo.on }),
   });
 })();
 </script>
