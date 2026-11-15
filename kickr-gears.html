@@ -418,7 +418,7 @@ dialog::backdrop { background: rgb(0 0 0 / .5); }
   const ZWIFT_COMPANY = 0x094a;
   const ZWIFT_SERVICES = [UUID.zwift, UUID.zwiftLegacy];
   const RIDE_ON = Uint8Array.of(0x52, 0x69, 0x64, 0x65, 0x4f, 0x6e); // "RideOn"
-  const APP_VERSION = '3 (15 Nov 2026)';
+  const APP_VERSION = '4 (15 Nov 2026)';
   const POWER_STEP = 5;
   const POWER_MIN = 50;
   const POWER_MAX = 600;
@@ -850,6 +850,7 @@ dialog::backdrop { background: rgb(0 0 0 / .5); }
     try { code = await cpWrite(Uint8Array.of(0x00)); } catch (_) { code = -1; }
     if (control.state !== 'starting') return;
     if (code === -1) { control.state = 'lost'; control.reason = 'error'; renderControl(); return; }
+    log('Trainer', `request control reply: ${code === null ? 'none' : code}`);
     if (code !== null && code !== 0x01) { control.state = 'refused'; control.reason = 'control'; renderControl(); return; }
     try { await cpWrite(Uint8Array.of(0x07)); } catch (_) { /* start is optional */ }
     if (control.state !== 'starting') return;
@@ -872,6 +873,7 @@ dialog::backdrop { background: rgb(0 0 0 / .5); }
         if (control.lastSent && sameBytes(bytes, control.lastSent)) continue;
         let code;
         try { code = await cpWrite(bytes, 1000); } catch (_) { code = -1; }
+        log('Trainer', `sent ${Array.from(bytes).join(' ')}, reply ${code === null ? 'none' : code}`);
         if (code === 0x01 || code === null) {
           control.lastSent = bytes;
         } else if (code === 0x05) {
@@ -909,6 +911,7 @@ dialog::backdrop { background: rgb(0 0 0 / .5); }
   }
   async function setupTrainer(server) {
     resetControl();
+    dataRetry.length = 0;
     let streams = 0;
     try {
       const all = await server.getPrimaryServices();
@@ -923,7 +926,10 @@ dialog::backdrop { background: rgb(0 0 0 / .5); }
         await subscribe(await ftms.getCharacteristic(UUID.bikeData), onIndoorBikeData);
         streams += 1;
         log('Trainer', 'bike data on');
-      } catch (err) { log('Trainer', `bike data failed: ${describeError(err)}`); }
+      } catch (err) {
+        log('Trainer', `bike data failed: ${describeError(err)}`);
+        dataRetry.push({ label: 'bike data', service: ftms, uuid: UUID.bikeData, handler: onIndoorBikeData });
+      }
       try {
         await subscribe(await ftms.getCharacteristic(UUID.machineStatus), onMachineStatus);
       } catch (err) { log('Trainer', `status failed: ${describeError(err)}`); }
@@ -937,18 +943,42 @@ dialog::backdrop { background: rgb(0 0 0 / .5); }
     }
     try {
       const cps = await getService(server, UUID.power);
-      await subscribe(await cps.getCharacteristic(UUID.powerMeasurement), onCyclingPower);
-      streams += 1;
-      log('Trainer', 'power service on');
-    } catch (err) { log('Trainer', `power service failed: ${describeError(err)}`); }
+      try {
+        await subscribe(await cps.getCharacteristic(UUID.powerMeasurement), onCyclingPower);
+        streams += 1;
+        log('Trainer', 'power service on');
+      } catch (err) {
+        log('Trainer', `power service failed: ${describeError(err)}`);
+        dataRetry.push({ label: 'power service', service: cps, uuid: UUID.powerMeasurement, handler: onCyclingPower });
+      }
+    } catch (err) { log('Trainer', `no power service: ${describeError(err)}`); }
     try {
       const hrs = await server.getPrimaryService(UUID.heartRate);
       await subscribe(await hrs.getCharacteristic(UUID.hrMeasurement), onTrainerHr);
     } catch (_) { /* trainer is not relaying heart rate */ }
-    if (!streams) throw new Error('Connected, but the trainer sent no power data');
+    // Control matters most: carry on without live numbers and keep asking for them.
+    if (!streams && !control.cp) throw new Error('Connected, but the trainer offered no data and no control');
+    if (!streams) log('Trainer', 'no live numbers yet, control only');
     control.state = control.cp ? 'idle' : 'unsupported';
   }
+  const dataRetry = [];
+  let dataRetryTimers = [];
+  async function retryData() {
+    for (const item of dataRetry.slice()) {
+      if (trainer.state !== 'live') return;
+      try {
+        await subscribe(await item.service.getCharacteristic(item.uuid), item.handler);
+        dataRetry.splice(dataRetry.indexOf(item), 1);
+        log('Trainer', `${item.label} on (after retry)`);
+      } catch (err) { log('Trainer', `${item.label} still failing: ${describeError(err)}`); }
+    }
+  }
+  function scheduleDataRetry() {
+    dataRetryTimers.forEach(clearTimeout);
+    dataRetryTimers = [2000, 6000, 15000].map((ms) => setTimeout(retryData, ms));
+  }
   function onTrainerUp() {
+    if (dataRetry.length) scheduleDataRetry();
     if (control.cp) takeControl();
     else renderControl();
   }
