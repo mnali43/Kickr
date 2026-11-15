@@ -268,6 +268,7 @@ final class BleLink {
     private void onMtu(BluetoothGatt g, int mtu, int status) {
         if (g != gatt || closed) return;
         main.removeCallbacks(mtuFallback);
+        hub.log(tag + ": packet size " + mtu + (status == BluetoothGatt.GATT_SUCCESS ? "" : " (" + Protocol.opStatusName(status) + ")"));
         discover();
     }
 

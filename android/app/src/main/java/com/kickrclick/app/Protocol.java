@@ -286,9 +286,26 @@ final class Protocol {
     static final int MSG_RIDE_KEYPAD = 0x23; // Click v2 and Ride
     static final int MSG_CLICK_KEYPAD = 0x37; // Click v1
 
-    /** The greeting that starts a session: "RideOn", plus 02 03 for the Click v2. */
-    static byte[] clickStart(boolean v2) {
-        return v2 ? concat(RIDE_ON, new byte[] {0x02, 0x03}) : RIDE_ON.clone();
+    /**
+     * Ways apps start a session with a Zwift controller. 1: "RideOn" (QZ, Zwift Click v1, Ride).
+     * 2: "RideOn" then FF 04 00 (an unlocked Click v2). 3: "RideOn" 02 03 (BikeControl's split pods).
+     */
+    static final int CLICK_GREETINGS = 3;
+
+    static byte[][] clickGreeting(int greeting) {
+        switch (greeting) {
+            case 1: return new byte[][] {RIDE_ON.clone(), CLICK_CHALLENGE_REPLY.clone()};
+            case 2: return new byte[][] {concat(RIDE_ON, new byte[] {0x02, 0x03})};
+            default: return new byte[][] {RIDE_ON.clone()};
+        }
+    }
+
+    static String clickGreetingName(int greeting) {
+        switch (greeting) {
+            case 1: return "RideOn + ff 04 00";
+            case 2: return "RideOn 02 03";
+            default: return "RideOn";
+        }
     }
 
     /** Buttons held down in a controller message, or -1 when it is not a button message. */

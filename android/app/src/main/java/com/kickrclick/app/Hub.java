@@ -68,6 +68,9 @@ final class Hub {
     private long trainerHoldUntil;
     private long clickHoldUntil;
     private long clickWatchUntil;
+    private long clickLostAt;
+    private boolean bikeDataLogged;
+    private boolean powerDataLogged;
     private int trainerFailures;
     private int clickFailures;
     private long trainerMissingSince;
@@ -347,16 +350,8 @@ final class Hub {
         int zwiftType = zwift != null && zwift.length > 0 ? zwift[0] & 0xFF : -1;
 
         if (zwiftType == Protocol.ZWIFT_CLICK_V2_RIGHT || zwiftType == Protocol.ZWIFT_CLICK_V1) {
-            if (click != null) {
-                // Seen advertising while we think it is connected: it restarted, so reconnect now.
-                if (now < clickWatchUntil && address.equals(click.address()) && click.connectedForMs() > 2500) {
-                    log("Click: it restarted, reconnecting");
-                    closeClick();
-                } else {
-                    return;
-                }
-            }
-            if (now >= clickHoldUntil && !busyConnecting()) connectClick(d, zwiftType, name);
+            // The pod keeps advertising while connected, so only connect when we have none.
+            if (click == null && now >= clickHoldUntil && !busyConnecting()) connectClick(d, zwiftType, name);
             return;
         }
         if (zwiftType >= 0 && seenZwift.add(address)) {
@@ -381,6 +376,8 @@ final class Hub {
 
     private void connectTrainer(BluetoothDevice d, String name) {
         log("Found the trainer" + (name != null ? " \"" + name + "\"" : "") + " (" + shortAddress(d.getAddress()) + ")");
+        bikeDataLogged = false;
+        powerDataLogged = false;
         trainer = new Trainer(this, d, name != null ? name : "Trainer");
         trainer.connect();
         updateScan();
@@ -390,6 +387,7 @@ final class Hub {
     private void connectClick(BluetoothDevice d, int type, String name) {
         log("Found " + (type == Protocol.ZWIFT_CLICK_V1 ? "a Zwift Click" : "the right Zwift Click v2 pod")
                 + (name != null ? " \"" + name + "\"" : "") + " (" + shortAddress(d.getAddress()) + ")");
+        clickLostAt = 0;
         click = new ClickPod(this, d, type);
         click.connect();
         updateScan();
@@ -412,8 +410,12 @@ final class Hub {
         log("Click: " + reason);
         if (c != click) return;
         click = null;
-        if (c.wasEverConnected()) clickFailures = 0;
-        else clickFailures++;
+        if (c.wasEverConnected()) {
+            clickFailures = 0;
+            clickLostAt = SystemClock.elapsedRealtime();
+        } else {
+            clickFailures++;
+        }
         clickHoldUntil = SystemClock.elapsedRealtime() + (300L << Math.min(clickFailures, 5));
         updateScan();
         changed();
@@ -425,6 +427,15 @@ final class Hub {
         updateScan();
         main.removeCallbacks(watchEnd);
         main.postDelayed(watchEnd, 15100);
+    }
+
+    /** The Click greeting that produced presses before, or -1 if none has yet. */
+    int clickGreeting() {
+        return prefs.getInt("clickGreeting", -1);
+    }
+
+    void rememberClickGreeting(int greeting) {
+        if (clickGreeting() != greeting) prefs.edit().putInt("clickGreeting", greeting).apply();
     }
 
     /** Never connect to this device again in this session. */
@@ -456,6 +467,12 @@ final class Hub {
 
     void onBikeData(Protocol.BikeData d) {
         long now = SystemClock.elapsedRealtime();
+        if (!bikeDataLogged) {
+            bikeDataLogged = true;
+            log("Trainer: bike data arriving (" + (d.hasPower ? d.powerW + " W" : "no power") + ", "
+                    + (Double.isNaN(d.cadenceRpm) ? "no cadence" : Math.round(d.cadenceRpm) + " rpm") + ", "
+                    + (Double.isNaN(d.speedKmh) ? "no speed" : String.format(Locale.US, "%.1f km/h", d.speedKmh)) + ")");
+        }
         if (d.hasPower) {
             bikePowerAt = now;
             addPower(now, d.powerW);
@@ -474,6 +491,10 @@ final class Hub {
     void onPowerData(Protocol.PowerData p) {
         if (!p.valid) return;
         long now = SystemClock.elapsedRealtime();
+        if (!powerDataLogged) {
+            powerDataLogged = true;
+            log("Trainer: power data arriving (" + p.powerW + " W" + (p.crankRevs >= 0 ? ", with crank data" : "") + ")");
+        }
         if (now - bikePowerAt > 3000) addPower(now, p.powerW);
         if (p.crankRevs >= 0) {
             double rpm = crank.update(p.crankRevs, p.crankTime, now);
@@ -568,17 +589,23 @@ final class Hub {
         }
     }
 
+    /** The Click was connected and has been gone for a few seconds: it is probably asleep. */
+    private boolean clickAsleep() {
+        return click == null && clickLostAt > 0 && SystemClock.elapsedRealtime() - clickLostAt > 5000;
+    }
+
     String clickStatus() {
         if (!running) return "Off";
         if (!bluetoothOn()) return "Bluetooth off";
-        if (click == null) return "Searching…";
+        if (click == null) return clickAsleep() ? "Asleep · press a button" : "Searching…";
         if (!click.isConnected()) return "Connecting…";
         int b = click.battery();
         return b >= 0 ? "Connected · " + b + "%" : "Connected";
     }
 
     int clickLevel() {
-        if (!running || click == null) return 0;
+        if (!running) return 0;
+        if (click == null) return clickAsleep() ? 1 : 0;
         return click.isConnected() ? 2 : 1;
     }
 
@@ -597,7 +624,17 @@ final class Hub {
         if (trainer == null && SystemClock.elapsedRealtime() - trainerMissingSince > 15000) {
             return "Still looking for the KICKR. Check it has power, and close Zwift or the Wahoo app on other devices so a connection is free.";
         }
-        if (click == null) return "Press a button on the right Click pod to wake it up.";
+        if (click == null) {
+            return clickAsleep()
+                    ? "The Click is asleep. Press any button on the right pod to wake it; that press doesn't change the power."
+                    : "Press a button on the right Click pod to wake it up.";
+        }
+        if (click.isConnected() && clickGreeting() < 0 && !click.pressesSeen()) {
+            if (click.gaveUp()) {
+                return "No button presses came from the Click. Close Zwift on the iPad completely, then tap Copy log and send the log to Claude.";
+            }
+            return "Press + on the right Click pod once every second or two until the target number changes (it can take up to a minute the first time).";
+        }
         return null;
     }
 
