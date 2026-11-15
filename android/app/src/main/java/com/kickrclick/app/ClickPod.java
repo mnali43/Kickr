@@ -13,17 +13,26 @@ final class ClickPod implements BleLink.Listener {
     private static final UUID BATTERY_LEVEL = Protocol.uuid16(0x2A19);
 
     final int type;
+    final int side; // Hub.RIGHT or Hub.LEFT
+    final String name;
     private final Hub hub;
     private final BleLink link;
+    private final boolean verbose;
     private ClickControl control;
     private BluetoothGattCharacteristic commands;
     private int battery = -1;
     private boolean everConnected;
+    private boolean restartRequested;
 
-    ClickPod(Hub hub, BluetoothDevice device, int type) {
+    /** @param verbose log everything (the first connections); routine reconnects only log problems */
+    ClickPod(Hub hub, BluetoothDevice device, int type, int side, boolean verbose) {
         this.hub = hub;
         this.type = type;
-        this.link = new BleLink(hub, device, "Click", this, false);
+        this.side = side;
+        this.verbose = verbose;
+        this.name = type == Protocol.ZWIFT_CLICK_V1 ? "Click" : side == Hub.LEFT ? "Left Click" : "Right Click";
+        this.link = new BleLink(hub, device, name, this, false, true);
+        this.link.setQuiet(!verbose);
     }
 
     void connect() {
@@ -47,6 +56,11 @@ final class ClickPod implements BleLink.Listener {
         return everConnected;
     }
 
+    /** The pod was told to restart, so losing it is expected. */
+    boolean restartRequested() {
+        return restartRequested;
+    }
+
     boolean pressesSeen() {
         return control != null && control.pressesSeen();
     }
@@ -60,9 +74,9 @@ final class ClickPod implements BleLink.Listener {
     }
 
     @Override
-    public void onLinkReady(BleLink l) {
+    public void onLinkReady(final BleLink l) {
         everConnected = true;
-        hub.log("Click: services " + l.describeServices());
+        if (verbose) hub.log(name + ": services " + l.describeServices());
         BluetoothGattService s = l.service(Protocol.ZWIFT_SERVICE);
         if (s == null) s = l.service(Protocol.ZWIFT_SERVICE_OLD);
         if (s == null) {
@@ -90,10 +104,12 @@ final class ClickPod implements BleLink.Listener {
         l.then(new Runnable() {
             @Override
             public void run() {
-                boolean v2 = type != Protocol.ZWIFT_CLICK_V1;
-                control = new ClickControl(io, v2, v2 ? hub.clickGreeting() : 0);
+                ClickControl.Keep keep = type == Protocol.ZWIFT_CLICK_V1 ? ClickControl.Keep.NONE
+                        : side == Hub.LEFT ? ClickControl.Keep.EVERY_MINUTE : ClickControl.Keep.WHEN_IDLE;
+                control = new ClickControl(io, name, keep, type == Protocol.ZWIFT_CLICK_V1 ? 0 : hub.clickGreeting(), verbose);
                 control.begin();
-                hub.changed();
+                l.relax();
+                hub.onClickReady(ClickPod.this);
             }
         });
     }
@@ -126,7 +142,7 @@ final class ClickPod implements BleLink.Listener {
 
         @Override
         public void pressed(int button) {
-            hub.onClickButton(button);
+            hub.onClickButton(ClickPod.this, button);
         }
 
         @Override
@@ -139,7 +155,8 @@ final class ClickPod implements BleLink.Listener {
 
         @Override
         public void restarting() {
-            hub.watchForClickRestart();
+            restartRequested = true;
+            hub.onClickRestarting(ClickPod.this);
         }
 
         @Override

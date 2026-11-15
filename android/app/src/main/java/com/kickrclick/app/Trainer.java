@@ -20,7 +20,7 @@ final class Trainer implements BleLink.Listener {
     Trainer(Hub hub, BluetoothDevice device, String name) {
         this.hub = hub;
         this.name = name;
-        this.link = new BleLink(hub, device, "Trainer", this, true);
+        this.link = new BleLink(hub, device, "Trainer", this, true, false);
     }
 
     void connect() {

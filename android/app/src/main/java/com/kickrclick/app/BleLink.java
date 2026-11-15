@@ -59,7 +59,9 @@ final class BleLink {
     private final Hub hub;
     private final Listener listener;
     private final boolean refreshServices;
+    private final boolean quick;
     private final Handler main;
+    private boolean quiet;
     private final ArrayDeque<Op> queue = new ArrayDeque<>();
     private BluetoothGatt gatt;
     private Op current;
@@ -69,13 +71,38 @@ final class BleLink {
     private boolean discovering;
     private long readyAt;
 
-    BleLink(Hub hub, BluetoothDevice device, String tag, Listener listener, boolean refreshServices) {
+    /**
+     * @param refreshServices clear Android's saved copy of the services first (the trainer)
+     * @param quick ask for a fast link while setting up, so a pod is back quickly after a restart
+     */
+    BleLink(Hub hub, BluetoothDevice device, String tag, Listener listener, boolean refreshServices, boolean quick) {
         this.hub = hub;
         this.device = device;
         this.tag = tag;
         this.listener = listener;
         this.refreshServices = refreshServices;
+        this.quick = quick;
         this.main = hub.main;
+    }
+
+    /** Routine reconnects: log only problems. */
+    void setQuiet(boolean q) {
+        quiet = q;
+    }
+
+    private void note(String message) {
+        if (!quiet) hub.log(message);
+    }
+
+    /** Back to a normal-speed link once set up, to spare the batteries. */
+    void relax() {
+        BluetoothGatt g = gatt;
+        if (g == null || closed || !quick) return;
+        try {
+            g.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_BALANCED);
+        } catch (RuntimeException ignored) {
+            // not important
+        }
     }
 
     boolean isClosed() {
@@ -95,7 +122,7 @@ final class BleLink {
     }
 
     void connect() {
-        hub.log(tag + ": connecting");
+        note(tag + ": connecting");
         try {
             gatt = device.connectGatt(hub.app, false, callback, BluetoothDevice.TRANSPORT_LE);
         } catch (RuntimeException e) {
@@ -221,14 +248,21 @@ final class BleLink {
     private void onConnectionState(final BluetoothGatt g, int status, int newState) {
         if (g != gatt || closed) return;
         if (newState == BluetoothProfile.STATE_CONNECTED && status == BluetoothGatt.GATT_SUCCESS) {
-            hub.log(tag + ": connected, reading its services");
+            note(tag + ": connected, reading its services");
             if (refreshServices) refreshSavedServices(g);
+            if (quick) {
+                try {
+                    g.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH);
+                } catch (RuntimeException ignored) {
+                    // carry on at normal speed
+                }
+            }
             main.postDelayed(new Runnable() {
                 @Override
                 public void run() {
                     if (g == gatt && !closed) askForBiggerPackets(g);
                 }
-            }, 400);
+            }, quick ? 100 : 400);
         } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
             close((ready ? "disconnected: " : "could not connect: ") + Protocol.linkStatusName(status));
         } else if (status != BluetoothGatt.GATT_SUCCESS) {
@@ -268,7 +302,7 @@ final class BleLink {
     private void onMtu(BluetoothGatt g, int mtu, int status) {
         if (g != gatt || closed) return;
         main.removeCallbacks(mtuFallback);
-        hub.log(tag + ": packet size " + mtu + (status == BluetoothGatt.GATT_SUCCESS ? "" : " (" + Protocol.opStatusName(status) + ")"));
+        note(tag + ": packet size " + mtu + (status == BluetoothGatt.GATT_SUCCESS ? "" : " (" + Protocol.opStatusName(status) + ")"));
         discover();
     }
 
@@ -427,7 +461,8 @@ final class BleLink {
         }, new Async.Done() {
             @Override
             public void done(int status) {
-                hub.log(tag + ": updates from " + name + (status == Protocol.OK ? " on" : " refused: " + Protocol.opStatusName(status)));
+                if (status == Protocol.OK) note(tag + ": updates from " + name + " on");
+                else hub.log(tag + ": updates from " + name + " refused: " + Protocol.opStatusName(status));
                 if (done != null) done.done(status);
             }
         }));

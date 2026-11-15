@@ -49,6 +49,21 @@ final class Hub {
     /** Free ride: no ERG, the Click changes virtual gears. */
     static final int MODE_GEARS = 1;
 
+    /** Click pod positions: the right pod (or an original single Click) and the left pod. */
+    static final int RIGHT = 0;
+    static final int LEFT = 1;
+
+    private static final class PodSlot {
+        ClickPod pod;
+        long holdUntil;
+        int failures;
+        long lostAt; // when a connected pod went away
+        long restartAt; // when it was told to restart, 0 if not restarting
+        boolean seen; // advertised at least once this session
+        int connections;
+        int restarts;
+    }
+
     private static Hub instance;
 
     static Hub get(Context context) {
@@ -72,21 +87,21 @@ final class Hub {
     private int chainVotes;
 
     private Trainer trainer;
-    private ClickPod click;
+    private final PodSlot[] pods = {new PodSlot(), new PodSlot()};
     private final Set<String> ignored = new HashSet<>();
     private final Set<String> seenZwift = new HashSet<>();
     private long trainerHoldUntil;
-    private long clickHoldUntil;
     private long clickWatchUntil;
-    private long clickLostAt;
     private boolean bikeDataLogged;
     private boolean powerDataLogged;
     private int trainerFailures;
-    private int clickFailures;
     private long trainerMissingSince;
+    private long startedAt;
 
     private BluetoothLeScanner scanner;
     private boolean scanning;
+    private int scanMode = -1;
+    private String lastSearch = "";
     private long lastScanStart = -100000;
 
     private final ArrayDeque<long[]> powerSamples = new ArrayDeque<>();
@@ -147,6 +162,7 @@ final class Hub {
             return;
         }
         running = true;
+        startedAt = SystemClock.elapsedRealtime();
         rideMs = 0;
         powerSum = 0;
         powerSeconds = 0;
@@ -163,12 +179,13 @@ final class Hub {
         if (!running) return;
         running = false;
         log("Stopping: letting go of the trainer and the Click");
+        lastSearch = "";
         main.removeCallbacks(everySecond);
         main.removeCallbacks(scanLater);
         main.removeCallbacks(watchEnd);
         stopScan();
         closeTrainer();
-        closeClick();
+        closeClicks();
         changed();
     }
 
@@ -179,11 +196,14 @@ final class Hub {
         t.close();
     }
 
-    private void closeClick() {
-        if (click == null) return;
-        ClickPod c = click;
-        click = null;
-        c.close();
+    private void closeClicks() {
+        for (PodSlot slot : pods) {
+            if (slot.pod == null) continue;
+            ClickPod c = slot.pod;
+            slot.pod = null;
+            slot.restartAt = 0;
+            c.close();
+        }
     }
 
     // ------------------------------------------------------------------ the rider's target
@@ -256,16 +276,17 @@ final class Hub {
         changed();
     }
 
-    void onClickButton(int bit) {
+    /** + is harder; − (left pod) and B (right pod) are easier. */
+    void onClickButton(ClickPod pod, int bit) {
         String name = Protocol.buttonName(bit);
         if (bit == Protocol.BTN_PLUS) {
             stepTarget(+1);
-            log("Click " + name + " → " + targetText());
+            log(pod.name + " " + name + " \u2192 " + targetText());
         } else if (bit == Protocol.BTN_B || bit == Protocol.BTN_MINUS) {
             stepTarget(-1);
-            log("Click " + name + " → " + targetText());
+            log(pod.name + " " + name + " \u2192 " + targetText());
         } else {
-            log("Click " + name + " (not used)");
+            log(pod.name + " " + name + " (not used)");
         }
     }
 
@@ -301,37 +322,49 @@ final class Hub {
         }
     };
 
+    /**
+     * Searches fast while the trainer, the right pod or a restarting pod is missing; slowly (to
+     * spare the battery and the radio) when only the left pod is.
+     */
     private void updateScan() {
         main.removeCallbacks(scanLater);
         long now = SystemClock.elapsedRealtime();
-        boolean want = running && bluetoothOn() && (trainer == null || click == null || now < clickWatchUntil);
+        boolean urgent = trainer == null || pods[RIGHT].pod == null || now < clickWatchUntil;
+        boolean want = running && bluetoothOn() && (urgent || pods[LEFT].pod == null);
         if (!want) {
             stopScan();
             return;
         }
-        if (scanning) return;
+        int desired = urgent ? ScanSettings.SCAN_MODE_LOW_LATENCY : ScanSettings.SCAN_MODE_LOW_POWER;
+        if (scanning && scanMode == desired) return;
         long wait = lastScanStart + 6500 - now; // Android allows 5 scan starts per 30 seconds
         if (wait > 0) {
-            main.postDelayed(scanLater, wait);
+            main.postDelayed(scanLater, wait); // keep any current search going until then
             return;
         }
-        startScan();
+        stopScan();
+        startScan(desired);
     }
 
-    private void startScan() {
+    private void startScan(int mode) {
         try {
             scanner = adapter.getBluetoothLeScanner();
             if (scanner == null) {
                 main.postDelayed(scanLater, 3000);
                 return;
             }
-            ScanSettings settings = new ScanSettings.Builder().setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY).build();
+            ScanSettings settings = new ScanSettings.Builder().setScanMode(mode).build();
             scanner.startScan(null, settings, scanCallback);
             scanning = true;
+            scanMode = mode;
             lastScanStart = SystemClock.elapsedRealtime();
             main.removeCallbacks(scanRefresh);
             main.postDelayed(scanRefresh, 10 * 60 * 1000L); // Android slows down very long searches
-            log("Searching for " + lookingFor());
+            String what = lookingFor();
+            if (!what.equals(lastSearch)) {
+                lastSearch = what;
+                log("Searching for " + what);
+            }
         } catch (SecurityException e) {
             log("Cannot search: the Nearby devices permission is missing");
         } catch (RuntimeException e) {
@@ -341,10 +374,11 @@ final class Hub {
     }
 
     private String lookingFor() {
-        if (trainer == null && click == null) return "the trainer and the Click";
-        if (trainer == null) return "the trainer";
-        if (click == null) return "the Click";
-        return "the Click after its restart";
+        StringBuilder b = new StringBuilder();
+        if (trainer == null) b.append("the trainer");
+        if (pods[RIGHT].pod == null) b.append(b.length() > 0 ? ", " : "").append("the right Click pod");
+        if (pods[LEFT].pod == null) b.append(b.length() > 0 ? ", " : "").append("the left Click pod");
+        return b.length() > 0 ? b.toString() : "a restarting Click pod";
     }
 
     private void stopScan() {
@@ -406,21 +440,26 @@ final class Hub {
         byte[] zwift = rec.getManufacturerSpecificData(Protocol.ZWIFT_COMPANY_ID);
         int zwiftType = zwift != null && zwift.length > 0 ? zwift[0] & 0xFF : -1;
 
-        if (zwiftType == Protocol.ZWIFT_CLICK_V2_RIGHT || zwiftType == Protocol.ZWIFT_CLICK_V1) {
-            // The pod keeps advertising while connected, so only connect when we have none.
-            if (click == null && now >= clickHoldUntil && !busyConnecting()) connectClick(d, zwiftType, name);
+        int side = zwiftType == Protocol.ZWIFT_CLICK_V2_LEFT ? LEFT
+                : zwiftType == Protocol.ZWIFT_CLICK_V2_RIGHT || zwiftType == Protocol.ZWIFT_CLICK_V1 ? RIGHT : -1;
+        if (side >= 0) {
+            PodSlot slot = pods[side];
+            slot.seen = true;
+            // A pod keeps advertising while connected, so only connect when that side has none.
+            if (slot.pod == null && now >= slot.holdUntil && !busyConnecting()) connectClick(d, zwiftType, side, name);
             return;
         }
         if (zwiftType >= 0 && seenZwift.add(address)) {
-            log("Seen a Zwift device, type 0x" + Integer.toHexString(zwiftType) + (name != null ? " \"" + name + "\"" : "")
-                    + (zwiftType == Protocol.ZWIFT_CLICK_V2_LEFT ? " (the left Click pod only works inside Zwift, so it is not used)" : ""));
+            log("Seen a Zwift device, type 0x" + Integer.toHexString(zwiftType) + (name != null ? " \"" + name + "\"" : ""));
         }
         if (trainer == null && now >= trainerHoldUntil && !busyConnecting() && looksLikeTrainer(rec, name)) connectTrainer(d, name);
     }
 
     /** One connection attempt at a time: parallel attempts make some phones fail with error 133. */
     private boolean busyConnecting() {
-        return (trainer != null && !trainer.isConnected()) || (click != null && !click.linkReady());
+        if (trainer != null && !trainer.isConnected()) return true;
+        for (PodSlot slot : pods) if (slot.pod != null && !slot.pod.linkReady()) return true;
+        return false;
     }
 
     private static boolean looksLikeTrainer(ScanRecord rec, String name) {
@@ -441,14 +480,45 @@ final class Hub {
         changed();
     }
 
-    private void connectClick(BluetoothDevice d, int type, String name) {
-        log("Found " + (type == Protocol.ZWIFT_CLICK_V1 ? "a Zwift Click" : "the right Zwift Click v2 pod")
-                + (name != null ? " \"" + name + "\"" : "") + " (" + shortAddress(d.getAddress()) + ")");
-        clickLostAt = 0;
-        click = new ClickPod(this, d, type);
-        click.connect();
+    private void connectClick(BluetoothDevice d, int type, int side, String name) {
+        PodSlot slot = pods[side];
+        boolean verbose = slot.connections < 2; // routine reconnects after restarts stay quiet in the log
+        slot.connections++;
+        if (verbose) {
+            log("Found " + (type == Protocol.ZWIFT_CLICK_V1 ? "a Zwift Click" : side == LEFT ? "the left Zwift Click v2 pod" : "the right Zwift Click v2 pod")
+                    + (name != null ? " \"" + name + "\"" : "") + " (" + shortAddress(d.getAddress()) + ")");
+        }
+        slot.pod = new ClickPod(this, d, type, side, verbose);
+        slot.pod.connect();
         updateScan();
         changed();
+    }
+
+    /** A pod is set up and greeted. */
+    void onClickReady(ClickPod c) {
+        PodSlot slot = pods[c.side];
+        if (slot.pod != c) return;
+        long now = SystemClock.elapsedRealtime();
+        slot.lostAt = 0;
+        if (slot.restartAt > 0) {
+            slot.restarts++;
+            if (slot.restarts <= 3) {
+                log(String.format(Locale.US, "%s: back %.1f s after its restart%s", c.name, (now - slot.restartAt) / 1000.0,
+                        slot.restarts == 3 ? " (further restarts are not logged)" : ""));
+            }
+            slot.restartAt = 0;
+        }
+        updateScan();
+        changed();
+    }
+
+    /** A pod was told to restart: search fast for a while so it is picked up again quickly. */
+    void onClickRestarting(ClickPod c) {
+        pods[c.side].restartAt = SystemClock.elapsedRealtime();
+        clickWatchUntil = SystemClock.elapsedRealtime() + 15000;
+        updateScan();
+        main.removeCallbacks(watchEnd);
+        main.postDelayed(watchEnd, 15100);
     }
 
     void onTrainerClosed(Trainer t, String reason) {
@@ -464,26 +534,21 @@ final class Hub {
     }
 
     void onClickClosed(ClickPod c, String reason) {
-        log("Click: " + reason);
-        if (c != click) return;
-        click = null;
+        PodSlot slot = pods[c.side];
+        boolean expected = c.restartRequested();
+        if (!expected || slot.restarts < 3) log(c.name + ": " + reason);
+        if (slot.pod != c) return;
+        slot.pod = null;
+        long now = SystemClock.elapsedRealtime();
         if (c.wasEverConnected()) {
-            clickFailures = 0;
-            clickLostAt = SystemClock.elapsedRealtime();
+            slot.failures = 0;
+            slot.lostAt = now;
         } else {
-            clickFailures++;
+            slot.failures++;
         }
-        clickHoldUntil = SystemClock.elapsedRealtime() + (300L << Math.min(clickFailures, 5));
+        slot.holdUntil = now + (expected ? 100 : 300L << Math.min(slot.failures, 5));
         updateScan();
         changed();
-    }
-
-    /** The Click was told to restart: keep searching for a while so it is picked up again quickly. */
-    void watchForClickRestart() {
-        clickWatchUntil = SystemClock.elapsedRealtime() + 15000;
-        updateScan();
-        main.removeCallbacks(watchEnd);
-        main.postDelayed(watchEnd, 15100);
     }
 
     /** The Click greeting that produced presses before, or -1 if none has yet. */
@@ -509,9 +574,9 @@ final class Hub {
                     scanning = false;
                     main.removeCallbacks(scanRefresh);
                 }
-                if (trainer != null || click != null) log("Bluetooth turned off");
+                if (trainer != null || pods[RIGHT].pod != null || pods[LEFT].pod != null) log("Bluetooth turned off");
                 closeTrainer();
-                closeClick();
+                closeClicks();
             } else if (state == BluetoothAdapter.STATE_ON) {
                 if (running) log("Bluetooth turned on");
                 updateScan();
@@ -625,6 +690,11 @@ final class Hub {
     private final Runnable everySecond = new Runnable() {
         @Override
         public void run() {
+            long now = SystemClock.elapsedRealtime();
+            for (PodSlot slot : pods) {
+                // Told to restart but still connected 20 s later: it didn't restart after all.
+                if (slot.restartAt > 0 && slot.pod != null && slot.pod.isConnected() && now - slot.restartAt > 20000) slot.restartAt = 0;
+            }
             int p = power3s();
             if (p > 0 || cadence() > 0) {
                 rideMs += 1000;
@@ -668,24 +738,36 @@ final class Hub {
         }
     }
 
-    /** The Click was connected and has been gone for a few seconds: it is probably asleep. */
-    private boolean clickAsleep() {
-        return click == null && clickLostAt > 0 && SystemClock.elapsedRealtime() - clickLostAt > 5000;
+    /** The pod was connected and has been gone for a while (longer if it was restarting): probably asleep. */
+    private boolean podAsleep(int side) {
+        PodSlot slot = pods[side];
+        long gone = SystemClock.elapsedRealtime() - slot.lostAt;
+        return slot.pod == null && slot.lostAt > 0 && gone > (slot.restartAt > 0 ? 15000 : 5000);
+    }
+
+    private String podWord(int side) {
+        PodSlot slot = pods[side];
+        if (slot.pod != null) {
+            if (!slot.pod.isConnected()) return "\u2026";
+            int b = slot.pod.battery();
+            return b >= 0 && b <= 20 ? "\u2713 (battery " + b + "%)" : "\u2713";
+        }
+        if (slot.restartAt > 0 && !podAsleep(side)) return "\u2026";
+        return podAsleep(side) ? "asleep" : "\u2013";
     }
 
     String clickStatus() {
         if (!running) return "Off";
         if (!bluetoothOn()) return "Bluetooth off";
-        if (click == null) return clickAsleep() ? "Asleep · press a button" : "Searching…";
-        if (!click.isConnected()) return "Connecting…";
-        int b = click.battery();
-        return b >= 0 ? "Connected · " + b + "%" : "Connected";
+        return "Right " + podWord(RIGHT) + " \u00b7 Left " + podWord(LEFT);
     }
 
     int clickLevel() {
         if (!running) return 0;
-        if (click == null) return clickAsleep() ? 1 : 0;
-        return click.isConnected() ? 2 : 1;
+        ClickPod right = pods[RIGHT].pod;
+        if (right != null && right.isConnected()) return 2;
+        if (right != null || pods[LEFT].pod != null || podAsleep(RIGHT) || pods[RIGHT].restartAt > 0) return 1;
+        return 0;
     }
 
     /** The line under the big number: whether the trainer has taken the latest change. */
@@ -710,13 +792,18 @@ final class Hub {
         if (trainer == null && SystemClock.elapsedRealtime() - trainerMissingSince > 15000) {
             return "Still looking for the KICKR. Check it has power, and close Zwift or the Wahoo app on other devices so a connection is free.";
         }
-        if (click == null) {
-            return clickAsleep()
-                    ? "The Click is asleep. Press any button on the right pod to wake it; that press doesn't change the power."
+        ClickPod right = pods[RIGHT].pod;
+        if (right == null && (pods[RIGHT].restartAt == 0 || podAsleep(RIGHT))) {
+            return podAsleep(RIGHT)
+                    ? "The right Click pod is asleep. Press any button on it to wake it; that press doesn't change anything."
                     : "Press a button on the right Click pod to wake it up.";
         }
-        if (click.isConnected() && clickGreeting() < 0 && !click.pressesSeen()) {
+        if (right != null && right.isConnected() && clickGreeting() < 0 && !right.pressesSeen()) {
             return "First time only: press + on the right Click pod once every second or two until the number changes (up to a minute).";
+        }
+        if (pods[LEFT].pod == null && pods[LEFT].restartAt == 0 && !pods[LEFT].seen
+                && SystemClock.elapsedRealtime() - startedAt < 120000) {
+            return "To use the left pod's \u2212 button too, press it once to wake it.";
         }
         return null;
     }
