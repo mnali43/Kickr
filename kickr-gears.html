@@ -418,7 +418,7 @@ dialog::backdrop { background: rgb(0 0 0 / .5); }
   const ZWIFT_COMPANY = 0x094a;
   const ZWIFT_SERVICES = [UUID.zwift, UUID.zwiftLegacy];
   const RIDE_ON = Uint8Array.of(0x52, 0x69, 0x64, 0x65, 0x4f, 0x6e); // "RideOn"
-  const APP_VERSION = '5 (15 Nov 2026)';
+  const APP_VERSION = '6 (15 Nov 2026)';
   const POWER_STEP = 5;
   const POWER_MIN = 50;
   const POWER_MAX = 600;
@@ -477,7 +477,7 @@ dialog::backdrop { background: rgb(0 0 0 / .5); }
     gear: START_GEAR,
     grade: 0,
     mode: store.get('mode', 'gears') === 'power' ? 'power' : 'gears',
-    watts: clampInt(store.get('watts', 150), POWER_MIN, POWER_MAX, 150),
+    watts: 150, // always start gently; never reuse the last target
   };
 
   /* ---------- gears ---------- */
@@ -857,6 +857,7 @@ dialog::backdrop { background: rgb(0 0 0 / .5); }
       catch (err) { log('Trainer', `Wahoo unlock failed: ${describeError(err)}`); }
       control.state = 'active';
       control.lastSent = null;
+      if (ride.mode !== 'power') setMode('power'); // this channel only does target power here
       renderControl();
       queueSim();
       return;
